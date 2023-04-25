@@ -13,6 +13,8 @@ public:
 private:
     static void *worker(void *arg);
     void run();
+    bool append(T *request, int state); // 添加新线程到线程池
+    bool append_p(T *request);
 private:
     int m_thread_number; //线程池中线程数
     int m_max_requests;  //最大请求数
@@ -20,7 +22,7 @@ private:
     std::list<T *> m_workqueue; //请求队列
     locker m_queuelocker; //保护请求队列的互斥锁
     sem m_queuestat; // 是否有任务要处理
-    connection_pool *m_connection; //数据库连接池？
+    connection_pool *m_connPool; //数据库连接池？
     int m_actor_model;  //模型切换
 };
 
@@ -53,6 +55,81 @@ template <typename T>
 threadpool<T>::~threadpool()
 {
     delete[] m_threads;
+}
+
+//添加线程
+template<typename T>
+bool threadpool<T>::append(T *request, int state){
+    m_queuelocker.lock();// 互斥锁
+    if(m_workqueue >= m_max_requests){
+        m_queuelocker.unlock();
+        return false;
+    }
+    request->m_state = state;
+    m_workqueue.push_back(request);
+    m_queuelocker.unlock();
+    m_queuestat.post();
+    return true;
+}
+
+template<typename T>
+bool threadpool<T>::append_p(T *request){
+    m_queuelocker.lock();
+    if(m_workqueue >= m_max_requests){
+        m_queuelocker.unlock();
+        return false;
+    }
+    m_workqueue.push_back(request);
+    m_queuelocker.unlock();
+    m_queuestat.post();
+    return true;
+}
+
+//线程处理函数
+template<typename T>
+void *threadpool<T>::worker(void *arg){
+    threadpool *pool = (threadpool *)arg;
+    pool->run();
+    return pool;
+}
+
+template<typename T>
+void threadpool<T>::run()
+{
+    while (true)
+    {
+        //信号量等待 是否有任务处理
+        m_queuestat.wait();
+        m_queuelocker.lock();
+        if(m_workqueue.empty()){
+            m_queuelocker.unlock();
+            continue;
+        }
+
+        //从队列中取出第一个任务 并 删除
+        T *request = m_workqueue.front();
+        m_workqueue.pop_front();
+        m_queuelocker.unlock();
+        if(!request)
+            continue;
+        
+        //处理 HTTP 请求的逻辑，根据服务器的模式（非阻塞模式或者 Reactor 模式）来处理请求。
+        if(1 == m_actor_model)
+        {
+            /*
+            
+
+            
+            
+            */
+        }else{
+            // 从连接池中取出一个数据库连接
+            connectionRAII mysqlcon(&request->mysql, m_connPool);
+            //调用process()函数处理请求
+            request->process();
+        }
+    }
+    
 }
 
 
