@@ -1,6 +1,6 @@
 LearningWebServer
 ===============
-此项目为一个学习TinyWebServer项目的记录，旨在亲自实现该项目。
+此项目为一个学习TinyWebServer项目的记录，旨在亲自实现、复刻该项目。
 
 ## 基础知识
 
@@ -51,7 +51,7 @@ V，如果有其他进行因为等待SV而挂起，则唤醒；若没有，则�
 
 
 
-3.**事件处理模式**：
+##### 3.事件处理模式：
 
 - reactor模式中，主线程(**I/O处理单元**)只负责监听文件描述符上是否有事件发生，有的话立即通知工作线程(**逻辑单元** )，读写数据、接受新连接及处理客户请求均在工作线程中完成。通常由**同步I/O**实现。
 - proactor模式中，主线程和内核负责处理读写数据、接受新连接等I/O操作，工作线程仅负责业务逻辑，如处理客户请求。通常由**异步I/O**实现。
@@ -117,3 +117,144 @@ void *threadpool<T>::worker(void *arg){
 2. 线程池创建与回收
 3. 向请求队列添加任务
 4. 线程处理函数
+
+
+
+## http连接处理
+
+#### 基础知识
+
+#### （一）epoll
+
+全称 eventpoll，是 linux 内核实现 IO 多路转接 / 复用（IO multiplexing）的一个实现。epoll 是 select 和 poll 的升级版，相较于这两个前辈，epoll 改进了工作方式，因此它更加高效。
+
+- 对于待检测集合select和poll是基于线性方式处理的，**epoll是基于红黑树**来管理待检测集合的。
+
+- select和poll每次都会线性扫描整个待检测集合，集合越大速度越慢，**epoll使用的是回调机制**，效率高，处理效率也不会随着检测集合的变大而下降
+- select和poll工作过程中存在内核/用户空间数据的频繁拷贝问题，**在epoll中内核和用户区使用的是共享内存（**基于mmap内存映射区实现），省去了不必要的内存拷贝。
+- 程序猿需要对select和poll返回的集合进行判断才能知道哪些文件描述符是就绪的，通过**epoll可以直接得到已就绪的文件描述符集合**，无需再次检测
+- 使用 epoll 没有最大文件描述符的限制，仅受系统中进程能打开的最大文件数目限制
+- **select和poll**都只能工作在相对低效的LT模式下，**epoll**则可以工作在ET高效模式，并且epoll还支持EPOLLONESHOT事件，该事件能进一步减少可读、可写和异常事件被触发的次数。
+
+> 注：当多路复用的文件数量庞大、IO 流量频繁的时候，一般不太适合使用 select () 和 poll ()，这种情况下 select () 和 poll () 表现较差，推荐使用 epoll ()。
+
+
+
+#### 2、操作函数
+
+```cpp
+#include <sys/epoll.h>
+// 创建epoll实例，通过一棵红黑树管理待检测集合
+int epoll_create(int size);
+->创建一个指示epoll内核事件表的文件描述符，该描述符将用作其他epoll系统调用的第一个参数，size不起作用。
+
+// 管理红黑树上的文件描述符(添加、修改、删除)
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
+->epfd：为epoll_creat的句柄
+->op：表示动作，用3个宏来表示：
+		EPOLL_CTL_ADD (注册新的fd到epfd)，
+		EPOLL_CTL_MOD (修改已经注册的fd的监听事件)，
+		EPOLL_CTL_DEL (从epfd删除一个fd)；
+->event：告诉内核需要监听的事件
+
+// 检测epoll树中是否有就绪的文件描述符 返回就绪的文件描述符个数
+int epoll_wait(int epfd, struct epoll_event * events, int maxevents, int timeout);
+->events：用来存内核得到事件的集合，
+->maxevents：告之内核这个events有多大，这个maxevents的值不能大于创建epoll_create()时的size，
+->timeout：是超时时间
+        -1：阻塞
+        0：立即返回，非阻塞
+        >0：指定毫秒
+->返回值：成功返回有多少文件描述符就绪，时间到时返回0，出错返回-1
+```
+
+其中，event是epoll_event结构体指针类型，表示内核所监听的事件，具体定义如下：
+
+```cpp
+struct epoll_event {
+    __uint32_t events; /* Epoll events */
+    epoll_data_t data; /* User data variable */
+};
+```
+
+- events描述事件类型，其中epoll事件类型有以下几种
+
+- - EPOLLIN：表示对应的文件描述符可以读（包括对端SOCKET正常关闭）
+  - EPOLLOUT：表示对应的文件描述符可以写
+  - EPOLLPRI：表示对应的文件描述符有紧急的数据可读（这里应该表示有带外数据到来）
+  - EPOLLERR：表示对应的文件描述符发生错误
+  - EPOLLHUP：表示对应的文件描述符被挂断；
+  - EPOLLET：将EPOLL设为边缘触发(Edge Triggered)模式，这是相对于水平触发(Level Triggered)而言的
+  - EPOLLONESHOT：只监听一次事件，当监听完这次事件之后，如果还需要继续监听这个socket的话，需要再次把这个socket加入到EPOLL队列里
+
+
+
+#### 3、 epoll 的工作模式
+
+- LT水平触发模式
+
+- - epoll_wait检测到文件描述符有事件发生，则将其通知给应用程序，应用程序可以不立即处理该事件。
+  - 当下一次调用epoll_wait时，epoll_wait还会再次向应用程序报告此事件，直至被处理
+
+- ET边缘触发模式
+
+- - epoll_wait检测到文件描述符有事件发生，则将其通知给应用程序，应用程序必须立即处理该事件
+  - 必须要一次性将数据读取完，使用非阻塞I/O，读取到出现eagain
+
+- EPOLLONESHOT
+
+- - 一个线程读取某个socket上的数据后开始处理数据，在处理过程中该socket上又有新数据可读，此时另一个线程被唤醒读取，此时出现两个线程处理同一个socket
+  - 我们期望的是一个socket连接在任一时刻都只被一个线程处理，通过epoll_ctl对该文件描述符注册epolloneshot事件，一个线程处理socket时，其他线程将无法处理，**当该线程处理完后，需要通过epoll_ctl重置epolloneshot事件**
+
+
+
+#### 4、HTTP报文格式
+
+HTTP报文分为请求报文和响应报文两种，每种报文必须按照特有格式生成，才能被浏览器端识别。
+
+- 请求报文：浏览器端向服务器发送的报文
+  - 种类：GET、POST
+  - 组成：请求行（request line）、请求头部（header）、空行和请求数据(主体)
+
+- 响应报文：服务器处理后返回给浏览器端的报文。
+  - 组成：状态行、消息报头、空行和响应正文。
+
+
+
+#### 5、有限状态机
+
+- 是一种抽象的理论模型，它能够把有限个变量描述的状态变化过程，以可构造可验证的方式呈现出来。
+- 有限状态机可以通过if-else,switch-case和函数指针来实现，从软件工程的角度看，主要是为了封装逻辑。
+
+```cpp
+ STATE_MACHINE(){
+ 2    State cur_State = type_A;
+     while(cur_State != type_C){
+         Package _pack = getNewPackage();
+         switch(){
+             case type_A:
+                 process_pkg_state_A(_pack);
+                 cur_State = type_B;
+                 break;
+            case type_B:
+                process_pkg_state_B(_pack);
+                cur_State = type_C;
+                break;
+        }
+    }
+}
+```
+
+- 该状态机包含三种状态：type_A，type_B和type_C。其中，type_A是初始状态，type_C是结束状态。
+- 状态机的当前状态记录在cur_State变量中，逻辑处理时，状态机先通过getNewPackage获取数据包，然后根据当前状态对数据进行处理，处理完后，状态机通过改变cur_State完成状态转移。
+- 有限状态机一种逻辑单元内部的一种高效编程方法，在服务器编程中，服务器可以根据不同状态或者消息类型进行相应的处理逻辑，使得程序逻辑清晰易懂。
+
+
+
+#### 6、http处理流程
+
+三步走：
+
+- 浏览器端发出http连接请求，主线程创建http对象接收请求并将所有数据读入对应buffer，将该对象插入任务队列，工作线程从任务队列中取出一个任务进行处理。
+- 工作线程取出任务后，调用process_read函数，通过主、从状态机对请求报文进行解析。
+- 解析完之后，跳转do_request函数生成响应报文，通过process_write写入buffer，返回给浏览器端。
