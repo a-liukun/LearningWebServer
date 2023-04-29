@@ -2,7 +2,7 @@
 
 WebServer::WebServer()
 {
-    //http_conn类对象
+    //http_conn类的对象
     users = new http_conn[MAX_FD];
 
     //root文件夹路径
